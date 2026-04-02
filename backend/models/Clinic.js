@@ -1,7 +1,20 @@
 const mongoose = require('mongoose');
 
 const ClinicSchema = new mongoose.Schema({
-    clinicEmail: { type: String, required: true, unique: true },
+    // --- ADDED CLINIC ID AS A UNIQUE KEY ---
+    clinicId: { 
+        type: String, 
+        required: true, 
+        unique: true, 
+        trim: true 
+    },
+    clinicEmail: { 
+        type: String, 
+        required: true, 
+        unique: true,
+        trim: true,
+        lowercase: true 
+    },
     passcode: { type: String, required: true }, 
     clinicName: { type: String, required: true },
     location: { type: String, required: true },

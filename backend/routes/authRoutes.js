@@ -27,7 +27,73 @@ transporter.verify((error, success) => {
     }
 });
 
-// --- LOGIN ROUTE ---
+// --- REGISTER CLINIC & SEND WELCOME EMAIL (UPDATED TO SAVE CLINIC ID) ---
+router.post('/register-clinic', async (req, res) => {
+    const { clinicId, clinicName, clinicEmail, passcode, contactNumber, location } = req.body;
+    const sanitizedEmail = clinicEmail.trim().toLowerCase();
+
+    try {
+        // Check if Clinic ID already exists
+        const existingClinicId = await Clinic.findOne({ clinicId });
+        if (existingClinicId) {
+            return res.status(400).json({ success: false, message: "Clinic ID already exists. Please use a unique ID." });
+        }
+
+        const existingClinic = await Clinic.findOne({ clinicEmail: sanitizedEmail });
+        if (existingClinic) {
+            return res.status(400).json({ success: false, message: "Clinic email already registered." });
+        }
+
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const newClinic = new Clinic({
+            clinicId, // Now saving the User-Entered Clinic ID
+            clinicName,
+            clinicEmail: sanitizedEmail,
+            passcode, 
+            contactNumber,
+            location,
+            status: 'Active',
+            resetPasswordToken: resetToken,
+            resetPasswordExpires: Date.now() + 86400000 
+        });
+
+        await newClinic.save();
+
+        const resetUrl = `http://localhost:3000/reset-password/${resetToken}`;
+        const mailOptions = {
+            from: '"DLabMate Admin" <dlabmate.np@gmail.com>',
+            to: sanitizedEmail,
+            subject: `Welcome to DLabMate - ${clinicName}`,
+            html: `
+                <div style="font-family: sans-serif; border: 1px solid #ddd; padding: 20px; border-radius: 10px;">
+                    <h2 style="color: #2563eb;">Welcome to the Platform!</h2>
+                    <p>Hello <strong>${clinicName}</strong>,</p>
+                    <p>Your clinic account has been created. You can now log in to track your dental cases.</p>
+                    <div style="background: #f1f5f9; padding: 15px; border-radius: 5px;">
+                        <p><strong>Login Email:</strong> ${sanitizedEmail}</p>
+                        <p><strong>Current Passcode:</strong> ${passcode}</p>
+                    </div>
+                    <p>For your security, please click the button below to set your own private password:</p>
+                    <a href="${resetUrl}" style="background: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Set New Password</a>
+                    <p style="font-size: 12px; color: #64748b; margin-top: 20px;">This link will expire in 24 hours.</p>
+                </div>
+            `
+        };
+
+        await transporter.sendMail(mailOptions);
+
+        res.status(201).json({ 
+            success: true, 
+            message: "Clinic registered and welcome email sent!" 
+        });
+
+    } catch (err) {
+        console.error("Clinic Registration Error:", err);
+        res.status(500).json({ success: false, message: "Failed to register clinic." });
+    }
+});
+
+// --- LOGIN ROUTE (UPDATED TO ENSURE CLINIC NAME AND IMAGE ARE SENT) ---
 router.post('/login', async (req, res) => {
     const { email, password, userType } = req.body;
     const sanitizedEmail = email.trim().toLowerCase();
@@ -46,12 +112,37 @@ router.post('/login', async (req, res) => {
             if (!clinic || clinic.passcode !== password) {
                 return res.status(401).json({ message: "Invalid Clinic Passcode" });
             }
+            
             const token = jwt.sign({ id: clinic._id, role: 'clinic' }, "SECRET_KEY", { expiresIn: '1d' });
-            return res.json({ token, role: 'clinic', message: "Clinic Portal Access Granted" });
+            
+            return res.json({ 
+                token, 
+                role: 'clinic', 
+                clinicName: clinic.clinicName, 
+                profileImage: clinic.profileImage, // Send saved image on login
+                message: "Clinic Portal Access Granted" 
+            });
         }
     } catch (err) {
         console.error("Login Error:", err);
         res.status(500).json({ message: "Server Error" });
+    }
+});
+
+// --- NEW: UPDATE CLINIC PROFILE IMAGE ---
+router.put('/update-clinic-image', async (req, res) => {
+    const { clinicName, profileImage } = req.body;
+    try {
+        const updatedClinic = await Clinic.findOneAndUpdate(
+            { clinicName: clinicName },
+            { $set: { profileImage: profileImage } },
+            { new: true }
+        );
+        if (!updatedClinic) return res.status(404).json({ success: false, message: "Clinic not found" });
+        res.json({ success: true, message: "Profile image updated successfully!" });
+    } catch (err) {
+        console.error("Image Update Error:", err);
+        res.status(500).json({ success: false, message: "Failed to save image" });
     }
 });
 
@@ -140,25 +231,69 @@ router.get('/cases-by-status/:status', async (req, res) => {
     }
 });
 
-// --- FETCH CLINICS LIST (UPDATED FOR DYNAMIC CASE COUNT & STATUS) ---
+// --- FETCH CLINICS LIST (UPDATED FOR ACCURATE COUNTS & 1W LOGIC) ---
 router.get('/clinics-list', async (req, res) => {
     try {
-        // Fetch all clinics
-        const clinics = await Clinic.find();
-        
-        // Map through clinics to calculate dynamic case counts based on clinicName
-        const clinicsWithCounts = await Promise.all(clinics.map(async (clinic) => {
-            const caseCount = await Case.countDocuments({ clinicName: clinic.clinicName });
-            return {
-                ...clinic._doc, // Preserves all fields like contactNumber, location, etc.
-                totalCases: caseCount // Dynamically calculated count from Case collection
-            };
-        }));
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
 
-        res.json({ success: true, clinics: clinicsWithCounts });
+        // Fetch using aggregation to get fresh counts for existing clinics
+        const clinicsWithCounts = await Clinic.aggregate([
+            {
+                $lookup: {
+                    from: 'cases',
+                    localField: 'clinicName',
+                    foreignField: 'clinicName',
+                    as: 'clinicCases'
+                }
+            },
+            {
+                $addFields: {
+                    totalCases: { $size: '$clinicCases' }
+                }
+            },
+            { $project: { clinicCases: 0 } }
+        ]);
+
+        const activeCount = clinicsWithCounts.filter(c => c.status === 'Active').length;
+        const inactiveCount = clinicsWithCounts.filter(c => c.status === 'Inactive').length;
+        
+        // Recently Added: Created within last 7 days
+        const recentCount = clinicsWithCounts.filter(c => 
+            new Date(c.createdAt) >= oneWeekAgo
+        ).length;
+
+        // Since we delete permanently, we return 0 for the removed stat unless a separate log is kept
+        const removedCount = 0; 
+
+        res.json({ 
+            success: true, 
+            clinics: clinicsWithCounts, 
+            stats: {
+                total: clinicsWithCounts.length,
+                active: activeCount,
+                inactive: inactiveCount,
+                recent: recentCount,
+                removed: removedCount
+            }
+        });
     } catch (err) {
         console.error("Error fetching clinics list:", err);
         res.status(500).json({ success: false, message: "Error fetching clinics" });
+    }
+});
+
+// --- PERMANENT DELETE ROUTE ---
+router.delete('/delete-clinic/:id', async (req, res) => {
+    try {
+        const deletedClinic = await Clinic.findByIdAndDelete(req.params.id);
+        if (!deletedClinic) {
+            return res.status(404).json({ success: false, message: "Clinic not found" });
+        }
+        res.json({ success: true, message: "Clinic permanently deleted from database" });
+    } catch (err) {
+        console.error("Permanent Delete Error:", err);
+        res.status(500).json({ success: false, message: "Server error during deletion" });
     }
 });
 
@@ -224,7 +359,7 @@ router.put('/update-case/:id', async (req, res) => {
     }
 });
 
-// --- NEW: UPDATE CASE STATUS DIRECTLY (For Status Page) ---
+// --- UPDATE CASE STATUS DIRECTLY ---
 router.patch('/update-case-status/:id', async (req, res) => {
     try {
         const { status, deliveryStatus } = req.body;
@@ -272,6 +407,7 @@ router.get('/lab-stats', async (req, res) => {
         const nextWeek = new Date();
         nextWeek.setDate(startOfToday.getDate() + 7);
 
+        // 1. Basic KPI Counts
         const [total, dueToday, dueWeek, overdue, completed] = await Promise.all([
             Case.countDocuments({}),
             Case.countDocuments({ dueDate: { $gte: startOfToday, $lte: endOfToday }, status: { $ne: 'Delivered' } }),
@@ -280,10 +416,12 @@ router.get('/lab-stats', async (req, res) => {
             Case.countDocuments({ status: 'Delivered' })
         ]);
 
+        // 2. Fetch recent upcoming cases
         const recentCases = await Case.find({ status: { $ne: 'Delivered' } })
             .sort({ dueDate: 1 })
             .limit(5);
 
+        // 3. Pipeline counts for the status bubbles
         const stages = ['Entered', 'Poured', 'Scanned', 'Designed', 'Milled', 'Printed', 'Finishing', 'Packed', 'Delivered'];
         const pipelineCounts = await Promise.all(
             stages.map(async (stage) => {
@@ -292,9 +430,28 @@ router.get('/lab-stats', async (req, res) => {
             })
         );
 
+        // 4. Summaries (This is where Zirconium logic was missing)
         const leftToDeliver = await Case.countDocuments({ status: { $ne: 'Delivered' }, dueDate: { $lte: endOfToday } });
         const deliveredToday = await Case.countDocuments({ status: 'Delivered', updatedAt: { $gte: startOfToday } });
-        const zirconiumMilled = await Case.countDocuments({ material: 'zirconia', status: 'Milled' });
+        const overdueCount = await Case.countDocuments({ dueDate: { $lt: startOfToday }, status: { $ne: 'Delivered' } });
+
+        // 5. NEW: Logic for Zirconium Units Milled (Summing the actual 'unit' field)
+        const zirconiumData = await Case.aggregate([
+            {
+                $match: {
+                    material: "zirconia", // Matches the 'value' from your frontend Select
+                    status: "Milled"      // Matches the 'value' from your status options
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    totalUnits: { $sum: "$unit" } // Sums the 'unit' field from each matching case
+                }
+            }
+        ]);
+
+        const zirconiumMilled = zirconiumData.length > 0 ? zirconiumData[0].totalUnits : 0;
 
         res.json({
             success: true,
@@ -304,8 +461,8 @@ router.get('/lab-stats', async (req, res) => {
             summaries: {
                 leftToDeliver,
                 deliveredToday,
-                overdue, 
-                zirconiumMilled
+                overdue: overdueCount,
+                zirconiumMilled // Now correctly populated
             }
         });
     } catch (err) {
@@ -319,34 +476,26 @@ router.get('/lab-stats', async (req, res) => {
 router.get('/notifications', async (req, res) => {
     try {
         const now = new Date();
-
-        // 1. Define Time Boundaries
         const startOfToday = new Date(now);
         startOfToday.setHours(0, 0, 0, 0);
-
         const endOfToday = new Date(now);
         endOfToday.setHours(23, 59, 59, 999);
-
         const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-        // 2. Fetch Overdue: Due date is BEFORE today AND not delivered
         const overdueCases = await Case.find({
             dueDate: { $lt: startOfToday },
             status: { $ne: 'Delivered' }
         }).select('caseId patientName clinicName');
 
-        // 3. Fetch Due Today: Due date is WITHIN today's 24hr window AND not delivered
         const dueToday = await Case.find({
             dueDate: { $gte: startOfToday, $lte: endOfToday },
             status: { $ne: 'Delivered' }
         }).select('caseId patientName clinicName');
 
-        // 4. Fetch New Arrivals: Created in the last 24 hours
         const newArrivals = await Case.find({
             createdAt: { $gte: twentyFourHoursAgo }
         }).select('caseId patientName clinicName');
 
-        // 5. Format for Frontend
         const notifications = [
             ...overdueCases.map(c => ({
                 id: `overdue-${c._id}`,
@@ -371,7 +520,6 @@ router.get('/notifications', async (req, res) => {
             }))
         ];
 
-        // Sort notifications so Overdue always stays at the top
         const sortedNotifications = notifications.sort((a, b) => {
             if (a.type === 'overdue' && b.type !== 'overdue') return -1;
             if (a.type !== 'overdue' && b.type === 'overdue') return 1;
